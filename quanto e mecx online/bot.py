@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import ccxt.async_support as ccxt
 import json
+import os
 import time
 import logging
 import traceback
@@ -12,6 +13,7 @@ POLL_INTERVAL = 3
 MAX_PAIRS = 50
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
+RELOAD_INTERVAL = 300  # ogni 5 minuti
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -32,8 +34,8 @@ def load_config():
             return data
     except FileNotFoundError:
         example = {
-            "TELEGRAM_TOKEN": "8471152392:AAHHYjhIcaGV1DVherO5sVYKO8OZubgY4r0",
-            "CHAT_ID": "721323324",
+            "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
+            "CHAT_ID": "INSERISCI_CHAT_ID",
             "SPREAD_THRESHOLD": 1.0
         }
         with open(CONFIG_FILE, "w") as f:
@@ -41,10 +43,15 @@ def load_config():
         print("Creato config.json — inserisci il tuo TOKEN Telegram e CHAT_ID.")
         raise SystemExit(1)
 
+def save_config(data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
 CONFIG = load_config()
 TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
 CHAT_ID = CONFIG.get("CHAT_ID")
 SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
+config_mtime = os.path.getmtime(CONFIG_FILE)
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram_message(text, session=None):
@@ -119,15 +126,31 @@ async def poll_loop():
     logging.info(f"Trovate {len(pairs)} coppie futures su MEXC.")
     await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
 
-    # Task parallelo per gestire /status
-    asyncio.create_task(handle_status_commands(session, prices, start_time))
+    # Task parallelo per /status, /reload, /setthreshold
+    asyncio.create_task(handle_telegram_commands(session, prices, start_time, ccxt_mexc, pairs))
+
+    last_reload = time.time()
+    global config_mtime, CONFIG, SPREAD_THRESHOLD
 
     try:
         while True:
-            tasks = []
-            for symbol in pairs:
-                async with semaphore:
-                    tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
+            # 🔁 Ricarica automatica se config cambia o ogni RELOAD_INTERVAL secondi
+            if time.time() - last_reload > RELOAD_INTERVAL or os.path.getmtime(CONFIG_FILE) != config_mtime:
+                CONFIG = load_config()
+                TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
+                CHAT_ID = CONFIG.get("CHAT_ID")
+                SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
+                config_mtime = os.path.getmtime(CONFIG_FILE)
+
+                new_pairs = await build_pairs(ccxt_mexc)
+                if set(new_pairs) != set(pairs):
+                    pairs[:] = new_pairs
+                    logging.info(f"Lista coppie aggiornata: {len(pairs)} trovate.")
+                    await send_telegram_message(f"♻️ Lista coppie aggiornata ({len(pairs)})", session)
+                last_reload = time.time()
+
+            tasks = [process_pair(symbol, ccxt_mexc, session, semaphore, prices, last_spread)
+                     for symbol in pairs]
             await asyncio.gather(*tasks)
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
@@ -137,55 +160,84 @@ async def poll_loop():
         await session.close()
         await ccxt_mexc.close()
 
-async def process_pair(symbol, exchange, session, prices, last_spread):
-    try:
-        mexc_p = await fetch_mexc_price(exchange, symbol)
-        if not mexc_p:
-            return
-        base = symbol.split("/")[0]
-        quanto_sym, quanto_p = await try_quanto_mappings(session, base)
-        if not quanto_p:
-            return
-        spread = (quanto_p - mexc_p) / mexc_p * 100
-        prices[symbol] = spread
+async def process_pair(symbol, exchange, session, semaphore, prices, last_spread):
+    async with semaphore:
+        try:
+            mexc_p = await fetch_mexc_price(exchange, symbol)
+            if not mexc_p:
+                return
+            base = symbol.split("/")[0]
+            quanto_sym, quanto_p = await try_quanto_mappings(session, base)
+            if not quanto_p:
+                return
+            spread = (quanto_p - mexc_p) / mexc_p * 100
+            prices[symbol] = spread
 
-        prev = last_spread.get(symbol, 0)
-        if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
-            direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
-            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
-            logging.info(msg)
-            await send_telegram_message(msg, session)
-        last_spread[symbol] = spread
+            prev = last_spread.get(symbol, 0)
+            if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
+                direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
+                msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
+                logging.info(msg)
+                await send_telegram_message(msg, session)
+            last_spread[symbol] = spread
+        except Exception as e:
+            logging.debug(f"Errore {symbol}: {e}")
 
-    except Exception as e:
-        logging.debug(f"Errore {symbol}: {e}")
-
-# ---------------- STATUS HANDLER ----------------
-async def handle_status_commands(session, prices, start_time):
-    last_update = 0
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+# ---------------- TELEGRAM COMMAND HANDLER ----------------
+async def handle_telegram_commands(session, prices, start_time, ccxt_mexc, pairs):
     offset = 0
+    global SPREAD_THRESHOLD, CONFIG
     while True:
         try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
             async with session.get(url, params={"offset": offset, "timeout": 10}) as resp:
                 data = await resp.json()
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
                     msg = update.get("message", {}).get("text", "")
-                    chat_id = update.get("message", {}).get("chat", {}).get("id")
-                    if msg == "/status" and str(chat_id) == str(CHAT_ID):
+                    chat_id = str(update.get("message", {}).get("chat", {}).get("id"))
+                    if chat_id != str(CHAT_ID):
+                        continue
+
+                    # --- /status ---
+                    if msg == "/status":
                         uptime = int(time.time() - start_time)
                         avg_spread = sum(prices.values()) / len(prices) if prices else 0
                         text = (
                             f"📊 *Status Bot*\n"
                             f"Coppie monitorate: {len(prices)}\n"
                             f"Spread medio: {avg_spread:.2f}%\n"
+                            f"Soglia: {SPREAD_THRESHOLD:.2f}%\n"
                             f"Uptime: {uptime//3600}h {uptime%3600//60}m\n"
                             f"Ultimo update: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
                         )
                         await send_telegram_message(text, session)
-        except Exception:
-            pass
+
+                    # --- /reload ---
+                    elif msg == "/reload":
+                        new_pairs = await build_pairs(ccxt_mexc)
+                        pairs[:] = new_pairs
+                        await send_telegram_message(f"🔄 Ricaricate {len(new_pairs)} coppie da MEXC.", session)
+
+                    # --- /setthreshold <valore> ---
+                    elif msg.startswith("/setthreshold"):
+                        parts = msg.split()
+                        if len(parts) == 2:
+                            try:
+                                new_val = float(parts[1])
+                                if new_val <= 0:
+                                    raise ValueError
+                                SPREAD_THRESHOLD = new_val
+                                CONFIG["SPREAD_THRESHOLD"] = new_val
+                                save_config(CONFIG)
+                                await send_telegram_message(f"✅ Nuova soglia impostata a {new_val:.2f}%", session)
+                                logging.info(f"Soglia aggiornata a {new_val}% via Telegram.")
+                            except ValueError:
+                                await send_telegram_message("❌ Uso corretto: /setthreshold 1.5", session)
+                        else:
+                            await send_telegram_message("❌ Uso corretto: /setthreshold 1.5", session)
+        except Exception as e:
+            logging.debug(f"Errore comandi Telegram: {e}")
         await asyncio.sleep(5)
 
 # ---------------- ENTRYPOINT ----------------
