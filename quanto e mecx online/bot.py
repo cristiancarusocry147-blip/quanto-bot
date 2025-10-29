@@ -2,18 +2,17 @@ import asyncio
 import aiohttp
 import ccxt.async_support as ccxt
 import json
-import os
 import time
 import logging
 import traceback
 from datetime import datetime
+from flask import Flask, render_template_string, request, redirect
 
 CONFIG_FILE = "config.json"
 POLL_INTERVAL = 3
 MAX_PAIRS = 50
 CONCURRENCY = 10
 LOG_FILE = "bot.log"
-RELOAD_INTERVAL = 300  # ogni 5 minuti
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -31,27 +30,25 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
             data.setdefault("SPREAD_THRESHOLD", 1.0)
+            data.setdefault("PAIRS", [])
             return data
     except FileNotFoundError:
         example = {
             "TELEGRAM_TOKEN": "INSERISCI_IL_TUO_TOKEN",
             "CHAT_ID": "INSERISCI_CHAT_ID",
-            "SPREAD_THRESHOLD": 1.0
+            "SPREAD_THRESHOLD": 1.0,
+            "PAIRS": []
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(example, f, indent=4)
         print("Creato config.json — inserisci il tuo TOKEN Telegram e CHAT_ID.")
         raise SystemExit(1)
 
-def save_config(data):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
 CONFIG = load_config()
 TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
 CHAT_ID = CONFIG.get("CHAT_ID")
 SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
-config_mtime = os.path.getmtime(CONFIG_FILE)
+PAIRS = CONFIG.get("PAIRS", [])
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram_message(text, session=None):
@@ -122,35 +119,23 @@ async def poll_loop():
     last_spread = {}
     start_time = time.time()
 
-    pairs = await build_pairs(ccxt_mexc)
-    logging.info(f"Trovate {len(pairs)} coppie futures su MEXC.")
+    if PAIRS:
+        pairs = PAIRS
+        logging.info(f"Monitoraggio di {len(pairs)} coppie dal config.json")
+    else:
+        pairs = await build_pairs(ccxt_mexc)
+        logging.info(f"Nessuna coppia specificata, caricate {len(pairs)} coppie da MEXC")
+
     await send_telegram_message(f"🤖 Bot avviato.\nMonitoraggio di {len(pairs)} coppie su MEXC.", session)
 
-    # Task parallelo per /status, /reload, /setthreshold
-    asyncio.create_task(handle_telegram_commands(session, prices, start_time, ccxt_mexc, pairs))
-
-    last_reload = time.time()
-    global config_mtime, CONFIG, SPREAD_THRESHOLD
+    asyncio.create_task(handle_status_commands(session, prices, start_time))
 
     try:
         while True:
-            # 🔁 Ricarica automatica se config cambia o ogni RELOAD_INTERVAL secondi
-            if time.time() - last_reload > RELOAD_INTERVAL or os.path.getmtime(CONFIG_FILE) != config_mtime:
-                CONFIG = load_config()
-                TELEGRAM_TOKEN = CONFIG.get("TELEGRAM_TOKEN")
-                CHAT_ID = CONFIG.get("CHAT_ID")
-                SPREAD_THRESHOLD = float(CONFIG.get("SPREAD_THRESHOLD", 1.0))
-                config_mtime = os.path.getmtime(CONFIG_FILE)
-
-                new_pairs = await build_pairs(ccxt_mexc)
-                if set(new_pairs) != set(pairs):
-                    pairs[:] = new_pairs
-                    logging.info(f"Lista coppie aggiornata: {len(pairs)} trovate.")
-                    await send_telegram_message(f"♻️ Lista coppie aggiornata ({len(pairs)})", session)
-                last_reload = time.time()
-
-            tasks = [process_pair(symbol, ccxt_mexc, session, semaphore, prices, last_spread)
-                     for symbol in pairs]
+            tasks = []
+            for symbol in pairs:
+                async with semaphore:
+                    tasks.append(process_pair(symbol, ccxt_mexc, session, prices, last_spread))
             await asyncio.gather(*tasks)
             await asyncio.sleep(POLL_INTERVAL)
     except Exception as e:
@@ -160,86 +145,121 @@ async def poll_loop():
         await session.close()
         await ccxt_mexc.close()
 
-async def process_pair(symbol, exchange, session, semaphore, prices, last_spread):
-    async with semaphore:
-        try:
-            mexc_p = await fetch_mexc_price(exchange, symbol)
-            if not mexc_p:
-                return
-            base = symbol.split("/")[0]
-            quanto_sym, quanto_p = await try_quanto_mappings(session, base)
-            if not quanto_p:
-                return
-            spread = (quanto_p - mexc_p) / mexc_p * 100
-            prices[symbol] = spread
+async def process_pair(symbol, exchange, session, prices, last_spread):
+    try:
+        mexc_p = await fetch_mexc_price(exchange, symbol)
+        if not mexc_p:
+            return
+        base = symbol.split("/")[0]
+        quanto_sym, quanto_p = await try_quanto_mappings(session, base)
+        if not quanto_p:
+            return
+        spread = (quanto_p - mexc_p) / mexc_p * 100
+        prices[symbol] = spread
 
-            prev = last_spread.get(symbol, 0)
-            if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
-                direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
-                msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
-                logging.info(msg)
-                await send_telegram_message(msg, session)
-            last_spread[symbol] = spread
-        except Exception as e:
-            logging.debug(f"Errore {symbol}: {e}")
+        prev = last_spread.get(symbol, 0)
+        if abs(spread) >= SPREAD_THRESHOLD and abs(spread) > abs(prev):
+            direction = "Compra su MEXC / Vendi su Quanto" if spread > 0 else "Vendi su MEXC / Compra su Quanto"
+            msg = f"{'🟢' if spread>0 else '🔴'} {symbol}\nSpread: {spread:.2f}%\n{direction}"
+            logging.info(msg)
+            await send_telegram_message(msg, session)
+        last_spread[symbol] = spread
+    except Exception as e:
+        logging.debug(f"Errore {symbol}: {e}")
 
-# ---------------- TELEGRAM COMMAND HANDLER ----------------
-async def handle_telegram_commands(session, prices, start_time, ccxt_mexc, pairs):
+# ---------------- STATUS HANDLER ----------------
+async def handle_status_commands(session, prices, start_time):
     offset = 0
-    global SPREAD_THRESHOLD, CONFIG
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
             async with session.get(url, params={"offset": offset, "timeout": 10}) as resp:
                 data = await resp.json()
                 for update in data.get("result", []):
                     offset = update["update_id"] + 1
                     msg = update.get("message", {}).get("text", "")
-                    chat_id = str(update.get("message", {}).get("chat", {}).get("id"))
-                    if chat_id != str(CHAT_ID):
-                        continue
-
-                    # --- /status ---
-                    if msg == "/status":
+                    chat_id = update.get("message", {}).get("chat", {}).get("id")
+                    if msg == "/status" and str(chat_id) == str(CHAT_ID):
                         uptime = int(time.time() - start_time)
                         avg_spread = sum(prices.values()) / len(prices) if prices else 0
                         text = (
                             f"📊 *Status Bot*\n"
                             f"Coppie monitorate: {len(prices)}\n"
                             f"Spread medio: {avg_spread:.2f}%\n"
-                            f"Soglia: {SPREAD_THRESHOLD:.2f}%\n"
                             f"Uptime: {uptime//3600}h {uptime%3600//60}m\n"
                             f"Ultimo update: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
                         )
                         await send_telegram_message(text, session)
-
-                    # --- /reload ---
-                    elif msg == "/reload":
-                        new_pairs = await build_pairs(ccxt_mexc)
-                        pairs[:] = new_pairs
-                        await send_telegram_message(f"🔄 Ricaricate {len(new_pairs)} coppie da MEXC.", session)
-
-                    # --- /setthreshold <valore> ---
-                    elif msg.startswith("/setthreshold"):
-                        parts = msg.split()
-                        if len(parts) == 2:
-                            try:
-                                new_val = float(parts[1])
-                                if new_val <= 0:
-                                    raise ValueError
-                                SPREAD_THRESHOLD = new_val
-                                CONFIG["SPREAD_THRESHOLD"] = new_val
-                                save_config(CONFIG)
-                                await send_telegram_message(f"✅ Nuova soglia impostata a {new_val:.2f}%", session)
-                                logging.info(f"Soglia aggiornata a {new_val}% via Telegram.")
-                            except ValueError:
-                                await send_telegram_message("❌ Uso corretto: /setthreshold 1.5", session)
-                        else:
-                            await send_telegram_message("❌ Uso corretto: /setthreshold 1.5", session)
-        except Exception as e:
-            logging.debug(f"Errore comandi Telegram: {e}")
+        except Exception:
+            pass
         await asyncio.sleep(5)
+
+# ---------------- WEB DASHBOARD ----------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return redirect("/dashboard")
+
+@app.route("/dashboard")
+def dashboard():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+            current_pairs = cfg.get("PAIRS", [])
+    except Exception:
+        current_pairs = PAIRS
+
+    html = """
+    <h2>MEXC Quanto Bot Dashboard</h2>
+    <p>Coppie monitorate:</p>
+    <ul>
+    {% for pair in pairs %}
+        <li>{{ pair }}
+        <form action="/removepair" method="post" style="display:inline;">
+            <input type="hidden" name="pair" value="{{ pair }}">
+            <button type="submit">❌ Rimuovi</button>
+        </form>
+        </li>
+    {% endfor %}
+    </ul>
+    <form action="/addpair" method="post">
+        <input name="pair" placeholder="es. BTC/USDT" required>
+        <button type="submit">➕ Aggiungi coppia</button>
+    </form>
+    """
+    return render_template_string(html, pairs=current_pairs)
+
+@app.route("/addpair", methods=["POST"])
+def add_pair():
+    pair = request.form.get("pair")
+    if pair:
+        with open(CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        if "PAIRS" not in cfg:
+            cfg["PAIRS"] = []
+        if pair not in cfg["PAIRS"]:
+            cfg["PAIRS"].append(pair)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=4)
+    return redirect("/dashboard")
+
+@app.route("/removepair", methods=["POST"])
+def remove_pair():
+    pair = request.form.get("pair")
+    with open(CONFIG_FILE, "r") as f:
+        cfg = json.load(f)
+    if "PAIRS" in cfg and pair in cfg["PAIRS"]:
+        cfg["PAIRS"].remove(pair)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=4)
+    return redirect("/dashboard")
 
 # ---------------- ENTRYPOINT ----------------
 if __name__ == "__main__":
-    asyncio.run(poll_loop())
+    import threading
+    threading.Thread(target=lambda: asyncio.run(poll_loop()), daemon=True).start()
+    app.run(host="0.0.0.0", port=5000)
+
+
+
